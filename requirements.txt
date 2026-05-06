@@ -1,0 +1,9 @@
+# Agentic AI Tutorial — Python dependencies
+# Tested with Python 3.11+
+pydantic-ai>=1.0
+sentence-transformers
+numpy
+mcp
+nest_asyncio
+ipykernel
+jupyter
