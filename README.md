@@ -8,6 +8,8 @@ Lab: https://colab.research.google.com/github/fifteen02/agentic-tutorial/blob/ma
 
 Solutions: https://colab.research.google.com/github/fifteen02/agentic-tutorial/blob/main/NB01_tutorial_solutions.ipynb
 
+Agentomics Tutorial: https://colab.research.google.com/github/fifteen02/agentic-tutorial/blob/main/agentomics_workshop.ipynb
+
 ## What's in this folder
 
 | File | What it is |
