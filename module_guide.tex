@@ -1274,6 +1274,186 @@ to a filesystem MCP server. Notice how the agent code does not
 change \textemdash{} only the manifest of available servers.
 \end{callout}
 
+\subsection{Structured Outputs and Validators}
+
+A tool-using agent is only as useful as the data it hands back. Free
+text is hard to consume programmatically: parsing it is brittle,
+schemas drift silently, and a single malformed response corrupts
+everything downstream. The modern fix is to make the output a
+\textbf{typed Pydantic model} and let the framework enforce the
+schema on every call.
+
+\textbf{The output schema.} Declare a \texttt{BaseModel} that names
+each field you want extracted, then pass the class as
+\texttt{output\_type} when constructing the agent. PydanticAI
+generates a JSON schema from the model, hands it to the LLM as part
+of the tool/response specification, and validates the reply before
+returning it to you.
+
+\begin{lstlisting}[language=Python]
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent
+
+class PaperSummary(BaseModel):
+    title: str
+    organism: str | None = Field(default=None)
+    method: str
+    key_metric: str = Field(description="Headline result, with units.")
+
+extractor = Agent(
+    "anthropic:claude-haiku-4-5",
+    output_type=PaperSummary,
+    system_prompt="Extract structured fields from a research paper abstract.",
+)
+
+result = extractor.run_sync(abstract_text)
+print(result.output.organism)   # typed access; no JSON parsing
+\end{lstlisting}
+
+\textbf{Validators \textemdash{} the second line of defence.}
+Even with a schema, LLMs occasionally hand back values that are
+technically the right type but practically wrong: inconsistent
+casing, missing units, hallucinated numbers, fields that contradict
+one another. Pydantic v2 gives you two hooks to fix this inside the
+model itself:
+
+\begin{itemize}[noitemsep, leftmargin=1.2em]
+  \item \texttt{@field\_validator('x')} \textemdash{} runs on a
+        single field after type coercion. Use it to normalise
+        whitespace, expand shorthands, or reject obviously bad
+        values.
+  \item \texttt{@model\_validator(mode='after')} \textemdash{} runs
+        once \emph{all} fields are populated. Use it for cross-field
+        rules (\textit{"if \texttt{organism} is set, \texttt{method}
+        must be one of the known assays"}).
+\end{itemize}
+
+\begin{lstlisting}[language=Python]
+from typing_extensions import Self
+from pydantic import BaseModel, field_validator, model_validator
+
+class PaperSummaryClean(BaseModel):
+    title: str
+    organism: str | None = None
+    method: str
+    key_metric: str
+
+    @field_validator("organism", mode="after")
+    @classmethod
+    def _normalise(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        aliases = {"human": "Homo sapiens", "mouse": "Mus musculus"}
+        return aliases.get(v.strip().lower(), v.strip())
+
+    @model_validator(mode="after")
+    def _metric_has_number(self) -> Self:
+        if not any(c.isdigit() for c in self.key_metric):
+            raise ValueError(f"key_metric has no number: {self.key_metric!r}")
+        return self
+\end{lstlisting}
+
+Validators run automatically on every agent call, so the rest of
+your pipeline only ever sees clean, consistent data. When a
+validator raises, PydanticAI surfaces the error to the model as a
+\texttt{ModelRetry}, and the agent gets one more attempt to produce
+a valid response \textemdash{} the schema becomes a self-healing
+contract rather than a brittle post-hoc check.
+
+\begin{ambercallout}
+\textbf{When to use which.}
+Reach for a \texttt{field\_validator} for single-field cleanup
+(normalisation, format checks, range limits). Reach for a
+\texttt{model\_validator(mode='after')} when the rule involves two
+or more fields, or when you need the fully-constructed object to
+make the decision. If a rule can be expressed as a regex or a
+\texttt{Field(constraint=\ldots{})}, prefer that over a validator
+\textemdash{} simpler, faster, self-documenting in the schema.
+\end{ambercallout}
+
+\subsection{Dependency Injection \textemdash{} RunContext}
+
+Tools rarely live in a vacuum. They need API keys, database
+connections, cached corpora, feature flags, per-user state. The
+notebook-friendly answer is to close over module-level globals; the
+production-friendly answer is \textbf{dependency injection}.
+
+PydanticAI's DI system has three pieces:
+
+\begin{enumerate}[noitemsep, leftmargin=1.4em]
+  \item A \texttt{@dataclass} (or any Python type) holding the
+        state the agent needs.
+  \item The agent is parameterised with \texttt{deps\_type=MyDeps}
+        so the type checker can verify every tool sees the same
+        shape.
+  \item Tools, system-prompt callbacks, and output validators
+        receive a \texttt{RunContext[MyDeps]} as their first
+        argument and read state via \texttt{ctx.deps}.
+\end{enumerate}
+
+The dependency instance is supplied at \texttt{run()} time, not at
+construction time \textemdash{} so the same agent object can serve
+different users, tenants, or test fixtures by varying the
+\texttt{deps=} argument.
+
+\begin{lstlisting}[language=Python]
+from dataclasses import dataclass
+from pydantic_ai import Agent, RunContext
+
+@dataclass
+class LitDeps:
+    abstracts: list[dict]  # the corpus to search
+    min_year: int          # ignore anything older than this
+
+lit_agent = Agent(
+    "anthropic:claude-haiku-4-5",
+    deps_type=LitDeps,
+    system_prompt="Answer questions about the loaded PubMed corpus.",
+)
+
+@lit_agent.tool
+def find_by_keyword(ctx: RunContext[LitDeps], keyword: str) -> list[str]:
+    """Return titles of cached papers whose abstract mentions `keyword`."""
+    kw = keyword.lower()
+    return [
+        a["title"]
+        for a in ctx.deps.abstracts
+        if kw in a["abstract"].lower()
+        and a.get("year", 9999) >= ctx.deps.min_year
+    ]
+
+deps = LitDeps(abstracts=CACHED_ABSTRACTS, min_year=2018)
+result = lit_agent.run_sync("Which papers mention amyloidosis?", deps=deps)
+print(result.output)
+\end{lstlisting}
+
+\textbf{Three concrete payoffs.}
+
+\begin{itemize}[noitemsep, leftmargin=1.2em]
+  \item \textbf{Testability.} A unit test passes a stub
+        \texttt{LitDeps} with three synthetic abstracts; no
+        monkey-patching, no global state to reset between tests.
+  \item \textbf{Per-run overrides.} \texttt{agent.override(deps=
+        \ldots{})} swaps the dependency for the duration of a
+        block \textemdash{} useful for evals, A/B comparisons, and
+        regression tests against canonical fixtures.
+  \item \textbf{Type safety across tools.} Because every tool's
+        signature names the same \texttt{RunContext[LitDeps]},
+        mypy / Pyright catches drift the moment one tool starts
+        expecting a field the dataclass does not have.
+\end{itemize}
+
+\begin{ambercallout}
+\textbf{Deps vs.\ closures \textemdash{} the rule of thumb.}
+If your tool reads anything that varies across runs
+(corpus version, user identity, environment), put it in
+\texttt{deps}. Reserve closures and module globals for true
+constants (the model identifier, regex patterns, hard-coded
+prompts). The boundary is the same one that separates
+\textit{configuration} from \textit{code}: deps for the former,
+closures for the latter.
+\end{ambercallout}
+
 % ════════════════════════════════════════════════════════════════
 \section{Module 4 \textemdash{} Practical Tips, Evals, and Observability}
 % ════════════════════════════════════════════════════════════════
